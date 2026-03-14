@@ -108,19 +108,27 @@ func rewriteFile(fset *token.FileSet, file *ast.File, pkg *PackageInfo) error {
 }
 
 // findFieldForSel resolves a selector expression to a bitfield.
-// It first tries to resolve the receiver type via varTypes, then falls back
-// to searching all structs (works when the field name is unambiguous).
+// It only matches when the receiver's type is known via varTypes and is a
+// bitfield struct. This prevents false matches on regular structs that happen
+// to share a field name with a bitfield (e.g. GraphTile.transitionCount vs
+// NodeInfo.transitionCount).
 func findFieldForSel(sel *ast.SelectorExpr, varTypes map[string]string, pkg *PackageInfo) (*StorageUnit, *PlacedField, bool) {
-	if varTypes != nil {
-		if id, ok := sel.X.(*ast.Ident); ok {
-			if structName, ok := varTypes[id.Name]; ok {
-				if info, ok := pkg.Structs[structName]; ok {
-					return FindFieldInStruct(sel.Sel.Name, info)
-				}
-			}
-		}
+	if varTypes == nil {
+		return nil, nil, false
 	}
-	return FindField(sel.Sel.Name, pkg)
+	id, ok := sel.X.(*ast.Ident)
+	if !ok {
+		return nil, nil, false
+	}
+	structName, ok := varTypes[id.Name]
+	if !ok {
+		return nil, nil, false
+	}
+	info, ok := pkg.Structs[structName]
+	if !ok {
+		return nil, nil, false
+	}
+	return FindFieldInStruct(sel.Sel.Name, info)
 }
 
 // buildVarTypes scans a function for variable→struct type mappings.
