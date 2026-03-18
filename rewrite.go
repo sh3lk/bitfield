@@ -108,27 +108,88 @@ func rewriteFile(fset *token.FileSet, file *ast.File, pkg *PackageInfo) error {
 }
 
 // findFieldForSel resolves a selector expression to a bitfield.
-// It only matches when the receiver's type is known via varTypes and is a
-// bitfield struct. This prevents false matches on regular structs that happen
-// to share a field name with a bitfield (e.g. GraphTile.transitionCount vs
-// NodeInfo.transitionCount).
+// It checks the receiver's type (via varTypes) directly and through embeddings.
+// When resolved through embedding, sel.X is mutated to include the embedding path
+// (e.g. o.flags → sel.X becomes o.NodeInfo so callers generate o.NodeInfo._bf0).
 func findFieldForSel(sel *ast.SelectorExpr, varTypes map[string]string, pkg *PackageInfo) (*StorageUnit, *PlacedField, bool) {
 	if varTypes == nil {
 		return nil, nil, false
 	}
-	id, ok := sel.X.(*ast.Ident)
-	if !ok {
-		return nil, nil, false
+
+	fieldName := sel.Sel.Name
+
+	// Case 1: sel.X is a simple identifier (most common: h.flags).
+	if id, ok := sel.X.(*ast.Ident); ok {
+		structName, ok := varTypes[id.Name]
+		if !ok {
+			return nil, nil, false
+		}
+		return resolveField(sel, structName, fieldName, pkg)
 	}
-	structName, ok := varTypes[id.Name]
-	if !ok {
-		return nil, nil, false
+
+	// Case 2: sel.X is a SelectorExpr (explicit path: o.NodeInfo.flags).
+	if innerSel, ok := sel.X.(*ast.SelectorExpr); ok {
+		typeName := innerSel.Sel.Name
+		if info, ok := pkg.Structs[typeName]; ok {
+			return FindFieldInStruct(fieldName, info)
+		}
 	}
-	info, ok := pkg.Structs[structName]
-	if !ok {
-		return nil, nil, false
+
+	return nil, nil, false
+}
+
+// resolveField looks up fieldName in structName directly and through embeddings.
+// When found through embedding, sel.X is mutated to include the path.
+func resolveField(sel *ast.SelectorExpr, structName, fieldName string, pkg *PackageInfo) (*StorageUnit, *PlacedField, bool) {
+	// Direct lookup in bitfield struct.
+	if info, ok := pkg.Structs[structName]; ok {
+		unit, field, ok := FindFieldInStruct(fieldName, info)
+		if ok {
+			return unit, field, true
+		}
+		// Field exists as a regular (non-bitfield) field → shadows promoted fields.
+		for _, fi := range info.Fields {
+			if fi.Name == fieldName && !fi.IsBitField && !fi.IsEmbedded {
+				return nil, nil, false
+			}
+		}
 	}
-	return FindFieldInStruct(sel.Sel.Name, info)
+
+	// Check if fieldName is directly declared on the outer struct (shadowing).
+	if fields, ok := pkg.DirectFields[structName]; ok {
+		if fields[fieldName] {
+			return nil, nil, false
+		}
+	}
+
+	// Search through embeddings.
+	for _, emb := range pkg.Embeddings[structName] {
+		info, ok := pkg.Structs[emb.StructName]
+		if !ok {
+			continue
+		}
+		unit, field, ok := FindFieldInStruct(fieldName, info)
+		if ok {
+			// Rewrite receiver to go through the embedding path.
+			recv := sel.X
+			for _, step := range emb.Path {
+				recv = &ast.SelectorExpr{X: recv, Sel: ast.NewIdent(step)}
+			}
+			sel.X = recv
+			return unit, field, true
+		}
+	}
+
+	return nil, nil, false
+}
+
+// isRelevantType returns true if typeName is a bitfield struct or embeds one.
+func isRelevantType(typeName string, pkg *PackageInfo) bool {
+	if _, ok := pkg.Structs[typeName]; ok {
+		return true
+	}
+	_, ok := pkg.Embeddings[typeName]
+	return ok
 }
 
 // buildVarTypes scans a function for variable→struct type mappings.
@@ -139,7 +200,7 @@ func buildVarTypes(fd *ast.FuncDecl, pkg *PackageInfo) map[string]string {
 	if fd.Recv != nil {
 		for _, recv := range fd.Recv.List {
 			if typeName := extractStructTypeName(recv.Type); typeName != "" {
-				if _, ok := pkg.Structs[typeName]; ok {
+				if isRelevantType(typeName, pkg) {
 					for _, name := range recv.Names {
 						m[name.Name] = typeName
 					}
@@ -152,7 +213,7 @@ func buildVarTypes(fd *ast.FuncDecl, pkg *PackageInfo) map[string]string {
 	if fd.Type.Params != nil {
 		for _, param := range fd.Type.Params.List {
 			if typeName := extractStructTypeName(param.Type); typeName != "" {
-				if _, ok := pkg.Structs[typeName]; ok {
+				if isRelevantType(typeName, pkg) {
 					for _, name := range param.Names {
 						m[name.Name] = typeName
 					}
@@ -199,7 +260,7 @@ func scanBlockForVarTypes(block *ast.BlockStmt, m map[string]string, pkg *Packag
 				if typeName == "" {
 					continue
 				}
-				if _, ok := pkg.Structs[typeName]; ok {
+				if isRelevantType(typeName, pkg) {
 					for _, name := range vs.Names {
 						m[name.Name] = typeName
 					}
@@ -210,7 +271,7 @@ func scanBlockForVarTypes(block *ast.BlockStmt, m map[string]string, pkg *Packag
 				if cl, ok := s.Rhs[0].(*ast.CompositeLit); ok {
 					typeName := typeNameFromExpr(cl.Type)
 					if typeName != "" {
-						if _, ok := pkg.Structs[typeName]; ok {
+						if isRelevantType(typeName, pkg) {
 							for _, lhs := range s.Lhs {
 								if id, ok := lhs.(*ast.Ident); ok {
 									m[id.Name] = typeName

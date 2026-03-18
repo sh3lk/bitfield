@@ -118,7 +118,7 @@ type IPv4Header struct {
 	assertEqual(t, "Name", info.Name, "IPv4Header")
 	assertEqual(t, "len(Fields)", len(info.Fields), 5)
 	assertEqual(t, "TotalSize", info.Layout.TotalSize, 4)
-	assertEqual(t, "len(Units)", len(info.Layout.Units), 3)
+	assertEqual(t, "len(Units)", len(info.Layout.Units), 2) // Length is full-width, treated as regular field
 
 	// Check fields
 	assertEqual(t, "Fields[0].Name", info.Fields[0].Name, "Version")

@@ -460,6 +460,618 @@ func f() {
 	}
 }
 
+// --- embedding tests ---
+
+func TestEmbeddedFieldPreserved(t *testing.T) {
+	src := `package test
+
+type Position struct {
+	X int
+	Y int
+}
+
+type Header struct {
+	Position
+	flags uint8 ` + "`bits:\"4\"`" + `
+	mode  uint8 ` + "`bits:\"4\"`" + `
+}
+`
+	result := transformAndFormat(t, src)
+	// Embedded field must survive in the output struct.
+	expectContains(t, result, "Position")
+	expectContains(t, result, "_bf0")
+	expectNotContains(t, result, "flags")
+	expectNotContains(t, result, "mode")
+}
+
+func TestEmbeddedPromotedRead(t *testing.T) {
+	src := `package test
+
+type NodeInfo struct {
+	flags uint8 ` + "`bits:\"4\"`" + `
+	count uint8 ` + "`bits:\"4\"`" + `
+}
+
+type Outer struct {
+	NodeInfo
+	extra uint32
+}
+
+func f() {
+	var o Outer
+	v := o.flags
+	_ = v
+}
+`
+	result := transformAndFormat(t, src)
+	// o.flags should be rewritten to access through o.NodeInfo._bf0
+	expectContains(t, result, "o.NodeInfo._bf0 & 0xf")
+}
+
+func TestEmbeddedPromotedWrite(t *testing.T) {
+	src := `package test
+
+type NodeInfo struct {
+	flags uint8 ` + "`bits:\"4\"`" + `
+	count uint8 ` + "`bits:\"4\"`" + `
+}
+
+type Outer struct {
+	NodeInfo
+	extra uint32
+}
+
+func f() {
+	var o Outer
+	o.flags = 5
+}
+`
+	result := transformAndFormat(t, src)
+	// o.flags = 5 should become inline set on o.NodeInfo._bf0
+	expectContains(t, result, "o.NodeInfo._bf0 = o.NodeInfo._bf0&^0xf | uint8(5)&0xf")
+}
+
+func TestEmbeddedPromotedIncDec(t *testing.T) {
+	src := `package test
+
+type NodeInfo struct {
+	flags uint8 ` + "`bits:\"4\"`" + `
+}
+
+type Outer struct {
+	NodeInfo
+}
+
+func f() {
+	var o Outer
+	o.flags++
+}
+`
+	result := transformAndFormat(t, src)
+	expectContains(t, result, "o.NodeInfo._bf0")
+}
+
+func TestEmbeddedExplicitPath(t *testing.T) {
+	src := `package test
+
+type NodeInfo struct {
+	flags uint8 ` + "`bits:\"4\"`" + `
+}
+
+type Outer struct {
+	NodeInfo
+	extra uint32
+}
+
+func f() {
+	var o Outer
+	v := o.NodeInfo.flags
+	_ = v
+}
+`
+	result := transformAndFormat(t, src)
+	// Explicit path o.NodeInfo.flags should also be rewritten.
+	expectContains(t, result, "o.NodeInfo._bf0 & 0xf")
+}
+
+func TestEmbeddedShadowing(t *testing.T) {
+	src := `package test
+
+type Inner struct {
+	flags uint8 ` + "`bits:\"4\"`" + `
+}
+
+type Outer struct {
+	Inner
+	flags uint32
+}
+
+func f() {
+	var o Outer
+	o.flags = 5
+	_ = o
+}
+`
+	result := transformAndFormat(t, src)
+	// o.flags refers to Outer.flags (uint32), not Inner.flags (bitfield).
+	// It should NOT be rewritten.
+	expectContains(t, result, "o.flags = 5")
+	expectNotContains(t, result, "o.Inner._bf0")
+}
+
+func TestEmbeddedTransitive(t *testing.T) {
+	src := `package test
+
+type Base struct {
+	x uint8 ` + "`bits:\"4\"`" + `
+}
+
+type Mid struct {
+	Base
+}
+
+type Top struct {
+	Mid
+}
+
+func f() {
+	var t Top
+	v := t.x
+	_ = v
+}
+`
+	result := transformAndFormat(t, src)
+	// t.x should be rewritten through t.Mid.Base._bf0
+	expectContains(t, result, "t.Mid.Base._bf0 & 0xf")
+}
+
+func TestEmbeddedPointer(t *testing.T) {
+	src := `package test
+
+type NodeInfo struct {
+	flags uint8 ` + "`bits:\"4\"`" + `
+}
+
+type Outer struct {
+	*NodeInfo
+	extra uint32
+}
+
+func f() {
+	var o Outer
+	v := o.flags
+	_ = v
+}
+`
+	result := transformAndFormat(t, src)
+	// *NodeInfo embedding: field name is still NodeInfo.
+	expectContains(t, result, "o.NodeInfo._bf0 & 0xf")
+	// The struct should preserve the pointer embedding.
+	expectContains(t, result, "*NodeInfo")
+}
+
+func TestEmbeddedCompositeLit(t *testing.T) {
+	src := `package test
+
+type NodeInfo struct {
+	flags uint8 ` + "`bits:\"4\"`" + `
+	count uint8 ` + "`bits:\"4\"`" + `
+}
+
+type Outer struct {
+	NodeInfo
+	extra uint32
+}
+
+func f() {
+	o := Outer{NodeInfo: NodeInfo{flags: 1, count: 2}, extra: 10}
+	_ = o
+}
+`
+	result := transformAndFormat(t, src)
+	// Inner NodeInfo{...} should be rewritten with _bf0.
+	expectContains(t, result, "_bf0:")
+	// Outer Outer{...} should preserve NodeInfo: and extra: keys.
+	expectContains(t, result, "NodeInfo:")
+	expectContains(t, result, "extra:")
+}
+
+// --- full-width field optimization ---
+
+func TestFullWidthFieldTreatedAsRegular(t *testing.T) {
+	src := `package test
+
+type H struct {
+	speed uint8  ` + "`bits:\"8\"`" + `
+	flags uint8  ` + "`bits:\"4\"`" + `
+	mode  uint8  ` + "`bits:\"4\"`" + `
+}
+
+func f() {
+	var h H
+	h.speed = 42
+	v := h.speed
+	_ = v
+}
+`
+	result := transformAndFormat(t, src)
+	// speed (full-width) should remain a regular field, not packed into _bf.
+	expectContains(t, result, "speed")
+	expectContains(t, result, "h.speed = 42")
+	expectContains(t, result, "h.speed")
+	// But flags/mode should be packed.
+	expectContains(t, result, "_bf0")
+}
+
+func TestFullWidthUint16(t *testing.T) {
+	src := `package test
+
+type H struct {
+	a uint16 ` + "`bits:\"16\"`" + `
+	b uint8  ` + "`bits:\"3\"`" + `
+}
+
+func f() {
+	var h H
+	h.a = 1000
+	_ = h.a
+}
+`
+	result := transformAndFormat(t, src)
+	// a (16 bits in uint16) is full-width → regular field.
+	expectContains(t, result, "h.a = 1000")
+	expectContains(t, result, "h.a")
+	// b should be packed.
+	expectContains(t, result, "_bf0")
+}
+
+func TestFullWidthDoesNotCreateBitfieldStruct(t *testing.T) {
+	// A struct where ALL fields are full-width should not be treated as a bitfield struct.
+	src := `package test
+
+type AllFull struct {
+	x uint8  ` + "`bits:\"8\"`" + `
+	y uint16 ` + "`bits:\"16\"`" + `
+}
+
+func f() {
+	var a AllFull
+	a.x = 1
+	a.y = 2
+	_ = a
+}
+`
+	result := transformAndFormat(t, src)
+	// No bitfield storage units should appear.
+	expectNotContains(t, result, "_bf0")
+	// Regular field access preserved.
+	expectContains(t, result, "a.x = 1")
+	expectContains(t, result, "a.y = 2")
+}
+
+// --- cross-struct field name collision (original bug) ---
+
+func TestNoFalseMatchAcrossStructs(t *testing.T) {
+	src := `package test
+
+type NodeInfo struct {
+	transitionCount uint8 ` + "`bits:\"4\"`" + `
+}
+
+type GraphTile struct {
+	transitionCount uint32
+}
+
+func f() {
+	var tile GraphTile
+	tile.transitionCount = 100
+	_ = tile.transitionCount
+}
+`
+	result := transformAndFormat(t, src)
+	// GraphTile.transitionCount is a regular field — must NOT be rewritten.
+	expectContains(t, result, "tile.transitionCount = 100")
+	expectContains(t, result, "tile.transitionCount")
+	expectNotContains(t, result, "tile._bf0")
+}
+
+func TestNoFalseMatchUnknownVariable(t *testing.T) {
+	src := `package test
+
+type NodeInfo struct {
+	flags uint8 ` + "`bits:\"4\"`" + `
+}
+
+func f(x interface{}) {
+	// x is not typed as a bitfield struct — should not be rewritten.
+	// (This won't compile in real Go, but tests the rewriter doesn't crash.)
+}
+`
+	// Should not panic or error.
+	_ = transformAndFormat(t, src)
+}
+
+// --- embedding: compound assignment ---
+
+func TestEmbeddedCompoundAssign(t *testing.T) {
+	src := `package test
+
+type NodeInfo struct {
+	flags uint8 ` + "`bits:\"4\"`" + `
+}
+
+type Outer struct {
+	NodeInfo
+}
+
+func f() {
+	var o Outer
+	o.flags += 1
+}
+`
+	result := transformAndFormat(t, src)
+	expectContains(t, result, "o.NodeInfo._bf0")
+	expectContains(t, result, "o.NodeInfo._bf0&0xf+1")
+}
+
+// --- embedding: address-of error ---
+
+func TestEmbeddedAddressOfError(t *testing.T) {
+	src := `package test
+
+type NodeInfo struct {
+	flags uint8 ` + "`bits:\"4\"`" + `
+}
+
+type Outer struct {
+	NodeInfo
+}
+
+func f() {
+	var o Outer
+	_ = &o.flags
+}
+`
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "test.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pkg, err := Pass1(fset, []*ast.File{f})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = Pass2(fset, []*ast.File{f}, pkg)
+	if err == nil {
+		t.Error("expected error for &o.flags through embedding")
+	} else {
+		expectContains(t, err.Error(), "cannot take address")
+	}
+}
+
+// --- embedding: method receiver ---
+
+func TestEmbeddedMethodReceiver(t *testing.T) {
+	src := `package test
+
+type NodeInfo struct {
+	flags uint8 ` + "`bits:\"4\"`" + `
+}
+
+type Outer struct {
+	NodeInfo
+}
+
+func (o *Outer) getFlags() uint8 {
+	return o.flags
+}
+`
+	result := transformAndFormat(t, src)
+	expectContains(t, result, "o.NodeInfo._bf0 & 0xf")
+}
+
+// --- embedding: function parameter ---
+
+func TestEmbeddedFuncParam(t *testing.T) {
+	src := `package test
+
+type NodeInfo struct {
+	flags uint8 ` + "`bits:\"4\"`" + `
+}
+
+type Outer struct {
+	NodeInfo
+}
+
+func process(o Outer) uint8 {
+	return o.flags
+}
+`
+	result := transformAndFormat(t, src)
+	expectContains(t, result, "o.NodeInfo._bf0 & 0xf")
+}
+
+// --- embedding: multiple embedded bitfield structs ---
+
+func TestEmbeddedMultipleBitfieldStructs(t *testing.T) {
+	src := `package test
+
+type A struct {
+	x uint8 ` + "`bits:\"4\"`" + `
+}
+
+type B struct {
+	y uint8 ` + "`bits:\"3\"`" + `
+}
+
+type C struct {
+	A
+	B
+}
+
+func f() {
+	var c C
+	vx := c.x
+	vy := c.y
+	_, _ = vx, vy
+}
+`
+	result := transformAndFormat(t, src)
+	expectContains(t, result, "c.A._bf0 & 0xf")
+	expectContains(t, result, "c.B._bf0 & 0x7")
+}
+
+// --- embedding: bitfield struct embeds another bitfield struct ---
+
+func TestBitfieldStructEmbedsBitfield(t *testing.T) {
+	src := `package test
+
+type Inner struct {
+	x uint8 ` + "`bits:\"4\"`" + `
+}
+
+type Outer struct {
+	Inner
+	y uint8 ` + "`bits:\"3\"`" + `
+}
+
+func f() {
+	var o Outer
+	vx := o.x
+	vy := o.y
+	_, _ = vx, vy
+}
+`
+	result := transformAndFormat(t, src)
+	// o.y is a direct bitfield of Outer.
+	expectContains(t, result, "o._bf0 & 0x7")
+	// o.x goes through embedding: o.Inner._bf0.
+	expectContains(t, result, "o.Inner._bf0 & 0xf")
+}
+
+// --- embedding: short variable declaration ---
+
+func TestEmbeddedShortDecl(t *testing.T) {
+	src := `package test
+
+type NodeInfo struct {
+	flags uint8 ` + "`bits:\"4\"`" + `
+}
+
+type Outer struct {
+	NodeInfo
+}
+
+func f() {
+	o := Outer{}
+	v := o.flags
+	_ = v
+}
+`
+	result := transformAndFormat(t, src)
+	expectContains(t, result, "o.NodeInfo._bf0 & 0xf")
+}
+
+// --- embedding: expression context ---
+
+func TestEmbeddedInExpression(t *testing.T) {
+	src := `package test
+
+type NodeInfo struct {
+	flags uint8 ` + "`bits:\"4\"`" + `
+}
+
+type Outer struct {
+	NodeInfo
+}
+
+func f() {
+	var o Outer
+	x := o.flags + 1
+	_ = x
+}
+`
+	result := transformAndFormat(t, src)
+	expectContains(t, result, "o.NodeInfo._bf0&0xf + 1")
+}
+
+// --- embedding: as function argument ---
+
+func TestEmbeddedAsFuncArg(t *testing.T) {
+	src := `package test
+
+type NodeInfo struct {
+	flags uint8 ` + "`bits:\"4\"`" + `
+}
+
+type Outer struct {
+	NodeInfo
+}
+
+func g(v uint8) {}
+
+func f() {
+	var o Outer
+	g(o.flags)
+}
+`
+	result := transformAndFormat(t, src)
+	expectContains(t, result, "g(o.NodeInfo._bf0 & 0xf)")
+}
+
+// --- embedding: shadowing in bitfield struct ---
+
+func TestShadowingInBitfieldStruct(t *testing.T) {
+	src := `package test
+
+type Inner struct {
+	x uint8 ` + "`bits:\"4\"`" + `
+}
+
+type Outer struct {
+	Inner
+	x uint8 ` + "`bits:\"3\"`" + `
+}
+
+func f() {
+	var o Outer
+	o.x = 5
+}
+`
+	result := transformAndFormat(t, src)
+	// o.x should resolve to Outer's own bitfield (3-bit), not Inner's (4-bit).
+	// Mask 0x7 = 3 bits, not 0xf = 4 bits.
+	expectContains(t, result, "0x7")
+	expectNotContains(t, result, "o.Inner._bf0")
+}
+
+// --- embedding: embedded field in positional composite literal ---
+
+func TestEmbeddedPositionalCompositeLit(t *testing.T) {
+	src := `package test
+
+type Pos struct {
+	X int
+}
+
+type H struct {
+	Pos
+	flags uint8 ` + "`bits:\"4\"`" + `
+	mode  uint8 ` + "`bits:\"4\"`" + `
+}
+
+func f() {
+	h := H{Pos{1}, 2, 3}
+	_ = h
+}
+`
+	result := transformAndFormat(t, src)
+	// Embedded field preserved as keyed.
+	expectContains(t, result, "Pos:")
+	// Bitfields packed.
+	expectContains(t, result, "_bf0:")
+}
+
 // --- helpers ---
 
 func expectNotContains(t *testing.T, s, sub string) {

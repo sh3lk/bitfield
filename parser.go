@@ -74,6 +74,7 @@ type FieldInfo struct {
 	Name       string
 	Type       BackingType
 	IsBitField bool
+	IsEmbedded bool
 	Width      int // bit width, only for bitfields
 	GoType     string
 }
@@ -91,7 +92,23 @@ func ParseStructType(fset *token.FileSet, structName string, st *ast.StructType)
 
 	for _, field := range st.Fields.List {
 		if len(field.Names) == 0 {
-			// Embedded field — skip (not supported as bitfield)
+			// Embedded field — preserve as regular field that breaks bitfield groups.
+			goTypeName := typeExprToString(field.Type)
+			embName := extractStructTypeName(field.Type)
+			if embName == "" {
+				continue
+			}
+			fieldInfos = append(fieldInfos, FieldInfo{
+				Name:       embName,
+				GoType:     goTypeName,
+				IsEmbedded: true,
+			})
+			descriptors = append(descriptors, FieldDescriptor{
+				Name:       embName,
+				IsBitField: false,
+				Size:       0,
+				Align:      1,
+			})
 			continue
 		}
 
@@ -127,17 +144,30 @@ func ParseStructType(fset *token.FileSet, structName string, st *ast.StructType)
 					return nil, fmt.Errorf("%s:%d: field %q: unsupported type %q for bitfield",
 						pos.Filename, pos.Line, name.Name, goTypeName)
 				}
-				fi.Type = backingType
-				fi.IsBitField = true
-				fi.Width = bt.Width
-				hasBitField = true
 
-				descriptors = append(descriptors, FieldDescriptor{
-					Name:       name.Name,
-					Type:       backingType,
-					Width:      bt.Width,
-					IsBitField: true,
-				})
+				// Full-width bitfield (e.g. uint8 bits:"8") — treat as regular field.
+				if bt.Width == TypeSize(backingType)*8 {
+					fi.Type = backingType
+					descriptors = append(descriptors, FieldDescriptor{
+						Name:       name.Name,
+						Type:       backingType,
+						IsBitField: false,
+						Size:       TypeSize(backingType),
+						Align:      TypeAlign(backingType),
+					})
+				} else {
+					fi.Type = backingType
+					fi.IsBitField = true
+					fi.Width = bt.Width
+					hasBitField = true
+
+					descriptors = append(descriptors, FieldDescriptor{
+						Name:       name.Name,
+						Type:       backingType,
+						Width:      bt.Width,
+						IsBitField: true,
+					})
+				}
 			} else {
 				// Regular field
 				backingType, ok := GoTypeToBackingType(goTypeName)

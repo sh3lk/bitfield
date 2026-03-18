@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/token"
+	"strings"
 )
 
 // GenerateStructFields rewrites an ast.StructType in-place, replacing bitfield
@@ -70,10 +71,16 @@ func GenerateStructFields(info *StructInfo) *ast.FieldList {
 
 		case 1: // regular field
 			fi := m.fieldInfo
-			fields = append(fields, &ast.Field{
-				Names: []*ast.Ident{ast.NewIdent(fi.Name)},
-				Type:  ast.NewIdent(fi.GoType),
-			})
+			if fi.IsEmbedded {
+				fields = append(fields, &ast.Field{
+					Type: goTypeToExpr(fi.GoType),
+				})
+			} else {
+				fields = append(fields, &ast.Field{
+					Names: []*ast.Ident{ast.NewIdent(fi.Name)},
+					Type:  ast.NewIdent(fi.GoType),
+				})
+			}
 			// Advance prevEnd by field size (approximate; Go handles alignment).
 			bt, ok := GoTypeToBackingType(fi.GoType)
 			if ok {
@@ -317,4 +324,19 @@ func intLit(v int) *ast.BasicLit {
 
 func hexLit(v int, _ string) *ast.BasicLit {
 	return &ast.BasicLit{Kind: token.INT, Value: fmt.Sprintf("0x%x", v)}
+}
+
+// goTypeToExpr converts a Go type string like "*Position" or "pkg.Type"
+// back to an AST expression, for use in embedded field generation.
+func goTypeToExpr(s string) ast.Expr {
+	if strings.HasPrefix(s, "*") {
+		return &ast.StarExpr{X: goTypeToExpr(s[1:])}
+	}
+	if idx := strings.Index(s, "."); idx >= 0 {
+		return &ast.SelectorExpr{
+			X:   ast.NewIdent(s[:idx]),
+			Sel: ast.NewIdent(s[idx+1:]),
+		}
+	}
+	return ast.NewIdent(s)
 }
